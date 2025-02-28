@@ -10,36 +10,44 @@
 const char* ssid     = "aalto open";
 const char* password = "";
 
-// URL to your MP3 stream (e.g., SomaFM, Icecast, etc.)
+// URL to your MP3 stream:
 const char* songURL  = "http://ice1.somafm.com/groovesalad-128-mp3";
 
 // -----------------------------
 // Sound Sensor Configuration
 // -----------------------------
-// MAX4466 analog output is read via an ADC-capable pin:
-const int SOUND_SENSOR_PIN  = 34; 
-// Calibrate this threshold for your environment:
-const int SOUND_THRESHOLD   = 2000;  
-// Required time (in milliseconds) above threshold:
-const unsigned long REQUIRED_TIME = 3000; // 5 seconds
+// MAX4466 analog output on an ADC-capable pin:
+const int   SOUND_SENSOR_PIN      = 34;  
+// Tune for your environment:
+const int   SOUND_THRESHOLD       = 2000;  
+// Required time above threshold (ms) to START playback:
+const unsigned long REQUIRED_TIME_ABOVE   = 2000;  
+// Required time below threshold (ms) to STOP playback:
+const unsigned long REQUIRED_TIME_BELOW   = 8000;  
 
 // -----------------------------
 // Audio Objects
 // -----------------------------
 AudioFileSourceHTTPStream *file;
-AudioGeneratorMP3 *mp3;
-AudioOutputI2S *out;
+AudioGeneratorMP3         *mp3;
+AudioOutputI2S            *out;
 
 // -----------------------------
-// State Tracking
+// Filter & State Tracking
 // -----------------------------
-bool  aboveThreshold       = false;  
-bool  triggeredPlayback    = false;  
-unsigned long thresholdStartTime = 0;  
+// float          filteredValue        = 0.0;  // For exponential filtering
+// const float    FILTER_ALPHA         = 0.2;  // 0 < alpha < 1 => alpha=0.2 is fairly moderate filtering
+
+bool           aboveThreshold       = false;
+bool           triggeredPlayback    = false;
+
+unsigned long  thresholdAboveStart  = 0;
+unsigned long  thresholdBelowStart  = 0; 
 
 void setup() {
   Serial.begin(115200);
-
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
   // Initialize sound sensor pin
   pinMode(SOUND_SENSOR_PIN, INPUT);
 
@@ -53,59 +61,85 @@ void setup() {
 
   // Prepare I2S audio output
   out = new AudioOutputI2S();
-  // BCLK=26, LRC=25, DIN=22 (adjust for your wiring):
+  // BCLK=26, LRC=25, DIN=22 (adjust for your wiring)
   out->SetPinout(26, 25, 22);
-  out->SetOutputModeMono(true);  // for MAX98357A
-  out->SetGain(0.5);             // 0.0 - 1.0 volume
+  out->SetOutputModeMono(true); // For MAX98357A
+  out->SetGain(0.2);            // 0.0 - 1.0 volume
 
-  // Prepare the source and MP3 generator but don't begin playback yet
+  // Prepare the MP3 file source but don't begin playback yet
   file = new AudioFileSourceHTTPStream(songURL);
   mp3  = new AudioGeneratorMP3();
 
-  Serial.println("Setup complete. Waiting for sound above threshold...");
+  // Initialize the filteredValue to avoid a big jump on first read
+  // filteredValue = analogRead(SOUND_SENSOR_PIN);
+
+  Serial.println("Setup complete. Waiting for continuous sound above threshold...");
 }
 
 void loop() {
-  // Read the microphone's analog value:
-  int sensorValue = analogRead(SOUND_SENSOR_PIN);
+  // 1) Read the microphone’s raw analog value
+  int filteredValue = analogRead(SOUND_SENSOR_PIN);
 
-  // Check if the value is above threshold
-  if (sensorValue > SOUND_THRESHOLD) {
-    Serial.println("Sound above threshold detected.");
+  // 2) Exponential filtering to reduce noise spikes
+
+  // filteredValue(t) = alpha*rawValue + (1-alpha)*filteredValue(t-1)
+  //filteredValue = FILTER_ALPHA * rawValue + (1.0f - FILTER_ALPHA) * filteredValue;
+
+  Serial.println(filteredValue);
+  // 3) Check if filtered value is above threshold
+  bool isAbove = (filteredValue > SOUND_THRESHOLD);
+
+  // ------------------------------------------------------
+  // START Playback Logic - Require 5 seconds above
+  // ------------------------------------------------------
+  if (isAbove) {
     if (!aboveThreshold) {
       // Just transitioned from below threshold to above
       aboveThreshold = true;
-      thresholdStartTime = millis(); 
-      Serial.println("Sound above threshold detected; timing started.");
-    } 
-    
-    else {
-      // We have been above threshold already; check how long
-      unsigned long elapsed = millis() - thresholdStartTime;
-      if (!triggeredPlayback && (elapsed >= REQUIRED_TIME)) {
-        // 5 seconds of continuous sound above threshold
-        Serial.println("5 seconds above threshold reached. Starting MP3...");
-        mp3->begin(file, out); // Start streaming
+      thresholdAboveStart = millis(); 
+      Serial.println("Above threshold detected; timing started for playback trigger.");
+    } else {
+      // Already above threshold; check elapsed time
+      unsigned long elapsedAbove = millis() - thresholdAboveStart;
+      if (!triggeredPlayback && (elapsedAbove >= REQUIRED_TIME_ABOVE)) {
+        // 5 seconds above threshold => start playback
+        Serial.println("5s above threshold => Starting MP3 playback...");
+        mp3->begin(file, out);
         triggeredPlayback = true;
       }
     }
-  } 
-  
-  
-  else {
-    // Below threshold => reset the above-threshold timer
+
+    // Since we are above threshold, reset below-threshold tracking
+    thresholdBelowStart = 0;
+
+  } else {
+    // Below threshold
     if (aboveThreshold) {
-      Serial.println("Sound fell below threshold, resetting timer...");
+      // Just transitioned from above threshold to below
+      aboveThreshold = false;
+      thresholdBelowStart = millis();
+      Serial.println("Below threshold detected; timing started for stopping playback.");
+    } else {
+      // Already below threshold; check if playback should stop
+      if (triggeredPlayback && thresholdBelowStart != 0) {
+        unsigned long elapsedBelow = millis() - thresholdBelowStart;
+        if (elapsedBelow >= REQUIRED_TIME_BELOW) {
+          // 5 seconds below threshold => stop playback
+          if (mp3->isRunning()) {
+            mp3->stop();
+            Serial.println("5s below threshold => Stopping MP3 playback.");
+          }
+          triggeredPlayback = false;
+        }
+      }
     }
-    aboveThreshold = false;
-    thresholdStartTime = 0;
   }
 
-  // Keep streaming if MP3 is running
+  // 4) Keep streaming if MP3 is running
   if (mp3->isRunning()) {
     mp3->loop();
-  } else {
-    // Avoid tight-loop spamming if not running
-    delay(50);
-  }
+  } 
+
+  delay(100);
+
 }
