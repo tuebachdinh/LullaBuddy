@@ -1,11 +1,13 @@
-ESP32    MAX4466 (Microphone)
+Power and groun
+
+ESP32    MAX4466 (Microphone) (1 pin)
 3.3V  ->  VCC
 GND   ->  GND
 GPIO34 ->  OUT
 
 -----------------------------------------------
 
-   ESP32         MAX98357A         Speaker
+   ESP32         MAX98357A(3 pin)         Speaker
   +--------+     +---------+     +---------+
   |   3.3V |---->| VIN     |     |         |
   |   GND  |---->| GND     |     |         |
@@ -16,6 +18,6 @@ GPIO34 ->  OUT
 
 ------------------------------------------------
 
-
+PIR sensor (1 pin)
 
 
