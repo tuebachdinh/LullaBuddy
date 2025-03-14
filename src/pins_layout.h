@@ -296,4 +296,13 @@
 
 #else
 #error "Camera model not selected"
+
+
+
 #endif
+
+#define SOUND_SENSOR_PIN 34
+#define MOTION_SENSOR_PIN 35  
+#define BCLK_AMPLIFIER_PIN 26
+#define DIN_AMPLIFIER_PIN 22
+#define LRC_AMPLIFIER_PIN 26
