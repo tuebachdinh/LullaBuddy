@@ -11,8 +11,8 @@
 // -----------------------------
 // WiFi and Streaming Credentials
 // -----------------------------
-const char* ssid     = "yuuu";
-const char* password = "servin022";
+const char* ssid     = "aalto open";
+const char* password = "";
 
 // -----------------------------
 // MP3 Streaming (song) URL
@@ -140,7 +140,7 @@ void setup() {
   Serial.println("\nWiFi connected");
 
   // --- Start the Camera Server ---
-  startCameraServer();
+  // startCameraServer();
   Serial.print("Camera Ready! Use 'http://");
   Serial.print(WiFi.localIP());
   Serial.println("' to connect");
@@ -224,3 +224,6 @@ void loop() {
 
   delay(100);
 }
+
+
+

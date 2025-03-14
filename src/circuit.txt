@@ -1,8 +1,5 @@
-Power and groun
 
 ESP32    MAX4466 (Microphone) (1 pin)
-3.3V  ->  VCC
-GND   ->  GND
 GPIO34 ->  OUT
 
 -----------------------------------------------
@@ -19,5 +16,6 @@ GPIO34 ->  OUT
 ------------------------------------------------
 
 PIR sensor (1 pin)
+GPIO35 -> OUT
 
 
