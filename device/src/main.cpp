@@ -4,226 +4,222 @@
 #include <AudioGeneratorMP3.h>
 #include <AudioOutputI2S.h>
 #include "esp_camera.h"
-#define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
 #include "pins_layout.h"
 
-// For testing
-// -----------------------------
-// WiFi and Streaming Credentials
-// -----------------------------
+//=== User-configurable ===
 const char* ssid     = "yuuu";
 const char* password = "";
-
-// -----------------------------
-// MP3 Streaming (song) URL
-// -----------------------------
 const char* songURL  = "http://ice1.somafm.com/groovesalad-128-mp3";
-float gain = 0.2;
+const float  gain    = 0.2;
 
+// sensor thresholds & timings
+const int   SOUND_THRESHOLD        = 2000;
+const unsigned long SOUND_DETECT_MS = 5000;  // 5 s continuous to count as “cry”
+const unsigned long MOTION_WINDOW_MS = 10000; // 10 s rolling window
+const int   MOTION_THRESHOLD       = 3;      // 3 distinct PIR trips in window
 
-const int SOUND_THRESHOLD  = 2000;  // Adjust for your environment
+// lullaby logic
+const int   MAX_LULLABIES          = 3;
 
-// Timing requirements (in milliseconds)
-const unsigned long REQUIRED_TIME_ABOVE = 5000; // 5 seconds above threshold to trigger playback
-const unsigned long REQUIRED_TIME_BELOW = 5000; // 5 seconds below threshold to stop playback
+// pin assignments
+const int ONOFF_PIN     = 4;   // your on/off toggle button
+const int PIR_PIN       = MOTION_SENSOR_PIN;
+const int MIC_PIN       = SOUND_SENSOR_PIN;
+const int ALERT_LED_PIN = 13;  // feedback local LED (optional)
 
-// -----------------------------
-// Global Variables for Sensor & Playback Control
-// -----------------------------
-bool aboveThreshold = false;         // True when a trigger condition (sound or motion) is active
-bool triggeredPlayback = false;      // True if the song is currently playing
-unsigned long thresholdAboveStart = 0; // Timestamp when trigger condition started
-unsigned long thresholdBelowStart = 0; // Timestamp when trigger condition stopped
-
-// -----------------------------
-// Audio Playback Objects
-// -----------------------------
+//=== WiFi & audio globals ===
 AudioFileSourceHTTPStream *file;
 AudioGeneratorMP3         *mp3;
 AudioOutputI2S            *out;
 
-// -----------------------------
-// Forward Declaration for Camera Server
-// (This function is implemented in app_httpd.cpp.)
-// -----------------------------
-void startCameraServer();
-void setupLedFlash(int pin);
+//=== State machines & timers ===
+bool deviceActive = false;
 
-// -----------------------------
-// Combined Setup Function
-// -----------------------------
+// --- button debouncing ---
+bool lastButtonReading = LOW;
+bool buttonState       = LOW;
+unsigned long lastDebounceTime = 0;
+const unsigned long DEBOUNCE_DELAY = 50;
+
+// --- motion detection (rolling‐window) ---
+bool  lastPirState    = LOW;
+int   motionCount     = 0;
+unsigned long motionWindowStart = 0;
+bool  motionWake      = false;
+
+// --- cry detection (continuous) ---
+bool  cryAbove        = false;
+unsigned long cryStartTime = 0;
+
+// --- lullaby tracking ---
+int   lullabyCount    = 0;
+
+// forward declarations
+void sendWarningToApp();
+void sendVibrateCommand();
+void resetAll();
+
 void setup() {
   Serial.begin(115200);
-  Serial.setDebugOutput(true);
-  Serial.println();
-
-  // --- Sound & Motion Sensors Setup ---
+  // sensors
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
-  pinMode(SOUND_SENSOR_PIN, INPUT);
-  pinMode(MOTION_SENSOR_PIN, INPUT);
+  pinMode(MIC_PIN, INPUT);
+  pinMode(PIR_PIN, INPUT);
+  pinMode(ONOFF_PIN, INPUT_PULLUP);
+  pinMode(ALERT_LED_PIN, OUTPUT);
+  digitalWrite(ALERT_LED_PIN, LOW);
 
-  // --- Camera Configuration Setup ---
-  camera_config_t config;
-  config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
-  config.pin_d0      = Y2_GPIO_NUM;
-  config.pin_d1      = Y3_GPIO_NUM;
-  config.pin_d2      = Y4_GPIO_NUM;
-  config.pin_d3      = Y5_GPIO_NUM;
-  config.pin_d4      = Y6_GPIO_NUM;
-  config.pin_d5      = Y7_GPIO_NUM;
-  config.pin_d6      = Y8_GPIO_NUM;
-  config.pin_d7      = Y9_GPIO_NUM;
-  config.pin_xclk    = XCLK_GPIO_NUM;
-  config.pin_pclk    = PCLK_GPIO_NUM;
-  config.pin_vsync   = VSYNC_GPIO_NUM;
-  config.pin_href    = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn    = PWDN_GPIO_NUM;
-  config.pin_reset   = RESET_GPIO_NUM;
-  config.xclk_freq_hz = 20000000;
-  config.frame_size  = FRAMESIZE_UXGA;
-  config.pixel_format = PIXFORMAT_JPEG;  // For streaming
-  config.grab_mode   = CAMERA_GRAB_WHEN_EMPTY;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
-  config.jpeg_quality = 12;
-  config.fb_count    = 1;
-
-  // Adjust configuration if PSRAM is available
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    if (psramFound()) {
-      config.jpeg_quality = 10;
-      config.fb_count = 2;
-      config.grab_mode = CAMERA_GRAB_LATEST;
-    } else {
-      config.frame_size = FRAMESIZE_SVGA;
-      config.fb_location = CAMERA_FB_IN_DRAM;
-    }
-  } else {
-    config.frame_size = FRAMESIZE_240X240;
-#if CONFIG_IDF_TARGET_ESP32S3
-    config.fb_count = 2;
-#endif
-  }
-
-  // Initialize camera
-  esp_err_t err = esp_camera_init(&config);
-  if (err != ESP_OK) {
-    Serial.printf("Camera init failed with error 0x%x", err);
-    return;
-  }
-  sensor_t *s = esp_camera_sensor_get();
-  if (s->id.PID == OV3660_PID) {
-    s->set_vflip(s, 1);        // Correct vertical flip
-    s->set_brightness(s, 1);
-    s->set_saturation(s, -2);
-  }
-  // For better initial frame rate when streaming, set a smaller resolution
-  if (config.pixel_format == PIXFORMAT_JPEG) {
-    s->set_framesize(s, FRAMESIZE_QVGA);
-  }
-
-  // Setup LED flash if available
-#if defined(LED_GPIO_NUM)
-  setupLedFlash(LED_GPIO_NUM);
-#endif
-
-  // --- WiFi Connection ---
+  // WiFi
   WiFi.begin(ssid, password);
   WiFi.setSleep(false);
   while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
+    delay(500); Serial.print(".");
   }
   Serial.println("\nWiFi connected");
 
-  // --- Start the Camera Server ---
-  // startCameraServer();
-  Serial.print("Camera Ready! Use 'http://");
-  Serial.print(WiFi.localIP());
-  Serial.println("' to connect");
-
-  // --- Audio Playback Setup ---
+  // audio output
   out = new AudioOutputI2S();
   out->SetPinout(BCLK_AMPLIFIER_PIN, LRC_AMPLIFIER_PIN, DIN_AMPLIFIER_PIN);
-  out->SetOutputModeMono(true); // For example, if using a MAX98357A board
-  out->SetGain(gain);            // Volume setting: 0.0 - 1.0
-
+  out->SetOutputModeMono(true);
+  out->SetGain(gain);
   file = new AudioFileSourceHTTPStream(songURL);
   mp3  = new AudioGeneratorMP3();
 
-  Serial.println("Setup complete. Monitoring sound and motion sensors...");
+  Serial.println("Setup complete. Waiting for ON/OFF...");
 }
 
-// -----------------------------
-// Combined Loop: Monitor Sound and Motion Sensors
-// -----------------------------
 void loop() {
-  // Read sound sensor value (analog)
-  int soundValue = analogRead(SOUND_SENSOR_PIN);
-  bool soundDetected = (soundValue > SOUND_THRESHOLD);
-
-  // Read motion sensor value (digital)
-  bool motionDetected = (digitalRead(MOTION_SENSOR_PIN) == HIGH); // Assumes HIGH means motion detected
-
-  // Combine both triggers; if either is active then we consider a trigger condition
-  bool triggerDetected = soundDetected || motionDetected;
-
-  // Print sensor readings (for debugging)
-  Serial.print("Sound: ");
-  Serial.print(soundValue);
-  Serial.print(" | Motion: ");
-  Serial.println(motionDetected ? "YES" : "NO");
-
-  if (triggerDetected) {
-    if (!aboveThreshold) {
-      aboveThreshold = true;
-      thresholdAboveStart = millis();
-      if (soundDetected && motionDetected) {
-        Serial.println("Both motion and crying detected! [HIGH ALERT]");
-      } else if (motionDetected) {
-        Serial.println("Motion detected! [Warning]");
-      } else if (soundDetected) {
-        Serial.println("Sound (crying) detected! [Warning]");
-      }
-    } else {
-      unsigned long elapsedAbove = millis() - thresholdAboveStart;
-      if (!triggeredPlayback && (elapsedAbove >= REQUIRED_TIME_ABOVE)) {
-        Serial.println("Trigger sustained for 5 seconds => Starting MP3 playback...");
-        mp3->begin(file, out);
-        triggeredPlayback = true;
-      }
-    }
-    // Reset below-threshold timer since a trigger is active
-    thresholdBelowStart = 0;
-  } else {
-    if (aboveThreshold) {
-      aboveThreshold = false;
-      thresholdBelowStart = millis();
-      Serial.println("No sound/motion detected; starting timer to stop playback.");
-    } else {
-      if (triggeredPlayback && thresholdBelowStart != 0) {
-        unsigned long elapsedBelow = millis() - thresholdBelowStart;
-        if (elapsedBelow >= REQUIRED_TIME_BELOW) {
-          if (mp3->isRunning()) {
-            mp3->stop();
-            Serial.println("No trigger for required time => Stopping MP3 playback.");
-          }
-          triggeredPlayback = false;
+  //—— handle on/off button ——
+  bool reading = digitalRead(ONOFF_PIN);
+  if (reading != lastButtonReading) {
+    lastDebounceTime = millis();
+  }
+  if (millis() - lastDebounceTime > DEBOUNCE_DELAY) {
+    if (reading != buttonState) {
+      buttonState = reading;
+      // toggle on falling edge of switch (assuming pull-up)
+      if (buttonState == LOW) {
+        deviceActive = !deviceActive;
+        if (!deviceActive) {
+          Serial.println("==> TURNED OFF");
+          resetAll();
+        } else {
+          Serial.println("==> TURNED ON");
         }
       }
     }
   }
+  lastButtonReading = reading;
 
-  // Continue processing MP3 playback if running
-  if (mp3->isRunning()) {
-    mp3->loop();
+  if (!deviceActive) {
+    delay(10);
+    return;
   }
 
-  delay(100);
+  unsigned long now = millis();
+
+  //—— PIR motion detection (rolling window) ——
+  bool pir = digitalRead(PIR_PIN);
+  // edge detect
+  bool rose = (pir == HIGH && lastPirState == LOW);
+  lastPirState = pir;
+
+  if (pir) {
+    // start/reset window
+    if (motionWindowStart == 0 || now - motionWindowStart > MOTION_WINDOW_MS) {
+      motionWindowStart = now;
+      motionCount = 0;
+    }
+    if (rose) {
+      motionCount++;
+      Serial.printf(" PIR edge #%d\n", motionCount);
+      if (motionCount >= MOTION_THRESHOLD) {
+        motionWake = true;
+        Serial.println(" >> MOTION: waking detected");
+      }
+    }
+  } else if (motionWindowStart && now - motionWindowStart > MOTION_WINDOW_MS) {
+    // expire window
+    motionWindowStart = 0;
+    motionCount = 0;
+  }
+
+  // once motionWake is true, we move on to cry detection...
+  if (motionWake) {
+    //—— cry detection — skip while playing lullaby ——
+    if (!mp3->isRunning()) {
+      int soundValue = analogRead(MIC_PIN);
+      bool soundHigh = (soundValue > SOUND_THRESHOLD);
+      Serial.printf(" Sound=%d\n", soundValue);
+
+      if (soundHigh) {
+        if (!cryAbove) {
+          cryAbove = true;
+          cryStartTime = now;
+        } else if (now - cryStartTime >= SOUND_DETECT_MS) {
+          // crying detected
+          Serial.println(" >> CRY: detected!");
+          sendWarningToApp();
+
+          if (lullabyCount < MAX_LULLABIES) {
+            lullabyCount++;
+            Serial.printf(" Playing lullaby #%d\n", lullabyCount);
+            mp3->begin(file, out);
+            digitalWrite(ALERT_LED_PIN, HIGH);
+          } else {
+            // after finishing 3, send vibrate instead
+            Serial.println(" Max lullabies reached → sending vibration");
+            sendVibrateCommand();
+          }
+          // reset cry detector until next motion
+          cryAbove = false;
+          motionWake = false;
+          motionWindowStart = 0;
+        }
+      } else {
+        cryAbove = false;
+      }
+    }
+  }
+
+  //—— manage playback loop ——
+  if (mp3->isRunning()) {
+    digitalWrite(ALERT_LED_PIN, HIGH);
+    mp3->loop();
+    // once playback finishes, LED goes off
+    if (!mp3->isRunning()) {
+      digitalWrite(ALERT_LED_PIN, LOW);
+      Serial.println(" Lullaby finished.");
+    }
+  }
+
+  delay(10);
 }
 
+// send a push/HTTP warning to parents’ app
+void sendWarningToApp() {
+  // TODO: implement your HTTP POST or push-notification here
+  Serial.println("[APP] Warning: baby crying!");
+}
 
+// send vibrate command to the phone via your app
+void sendVibrateCommand() {
+  // TODO: implement your HTTP call to trigger phone vibration
+  Serial.println("[APP] Command: vibrate phone");
+}
 
+// reset all state when turning off
+void resetAll() {
+  // motion
+  motionCount = 0;
+  motionWindowStart = 0;
+  motionWake = false;
+  // cry
+  cryAbove = false;
+  // lullaby
+  lullabyCount = 0;
+  // stop any playing song
+  if (mp3->isRunning()) mp3->stop();
+  digitalWrite(ALERT_LED_PIN, LOW);
+}
