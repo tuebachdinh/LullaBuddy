@@ -5,27 +5,29 @@
 #include <AudioOutputI2S.h>
 #include "esp_camera.h"
 #define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
-#include "pins_layout.h" 
+#include "pins_layout.h"
 #include <WebServer.h>
 
 //=== User-configurable ===
-const char* ssid     = "aalto open";
-const char* password = "";
-const char* songURL  = "http://ice1.somafm.com/groovesalad-128-mp3";
+const char* ssid     = "yuuu";
+const char* password = "servin022";
+const char* songURL  = "https://ia600107.us.archive.org/13/items/LullabySong/06-nickelback-lullaby.mp3";
 const float  gain    = 0.2;
 
 // sensor thresholds & timings
-const int   SOUND_THRESHOLD         = 2000;
-const unsigned long SOUND_DETECT_MS = 5000;   // 5 s continuous
-const unsigned long MOTION_WINDOW_MS= 10000;  // 10 s rolling window
-const int   MOTION_THRESHOLD        = 3;      // 3 distinct PIR trips
+const int SOUND_THRESHOLD        = 2000;     // raw mic threshold (unused now)
+const unsigned long PIR_HIGH_MS  = 3000;     // PIR must stay HIGH for 3 s
+const unsigned long CRY_WINDOW_MS= 5000;     // listen 5 s after PIR
+// new diff-based cry thresholds
+const int  DIFF_THRESHOLD        = 300;      // diff > 300 counts as cry spike
+const int  CRY_COUNT_THRESHOLD   = 50;      // need 100 such spikes in window
 
 // lullaby logic
-const int   MAX_LULLABIES           = 3;
+const int MAX_LULLABIES         = 3;
 
 // pin assignments
-const int PIR_PIN      = MOTION_SENSOR_PIN;
-const int MIC_PIN      = SOUND_SENSOR_PIN;
+const int PIR_PIN = MOTION_SENSOR_PIN;
+const int MIC_PIN = SOUND_SENSOR_PIN;
 
 //=== Networking & server ===
 WebServer server(80);
@@ -36,16 +38,14 @@ AudioFileSourceHTTPStream *file;
 AudioGeneratorMP3         *mp3;
 AudioOutputI2S            *out;
 
-//=== Motion / cry state machines & timers ===
-bool  lastPirState     = LOW;
-int   motionCount      = 0;
-unsigned long motionWindowStart = 0;
-bool  motionWake       = false;
+//=== Motion / cry state ===
+unsigned long pirHighStart    = 0;
+bool         pirTriggered     = false;
+unsigned long cryWindowStart  = 0;
+int          prevSoundV       = 0;
+int          crySpikeCount    = 0;   // count of diffs exceeding DIFF_THRESHOLD
 
-bool  cryAbove         = false;
-unsigned long cryStartTime = 0;
-
-int   lullabyCount     = 0;
+int          lullabyCount     = 0;
 
 // Forward declarations
 void sendWarningToApp();
@@ -109,44 +109,36 @@ void loop() {
     return;
   }
 
-  // 2) PIR motion detection (rolling-window edge count)
+  // 2) PIR: sustained HIGH for 3 s to trigger wake
   bool pir = digitalRead(PIR_PIN);
-  Serial.printf(" PIR=%d\n", pir);
-  int soundV1 = analogRead(MIC_PIN);
-  Serial.printf(" Sound=%d\n", soundV1);
-  delay(200);
-
-  bool rose = (pir == HIGH && lastPirState == LOW);
-  lastPirState = pir;
-  if (pir) {
-    if (motionWindowStart == 0 || now - motionWindowStart > MOTION_WINDOW_MS) {
-      motionWindowStart = now;
-      motionCount = 0;
-    }
-    if (rose) {
-      motionCount++;
-      Serial.printf(" PIR edge #%d\n", motionCount);
-      if (motionCount >= MOTION_THRESHOLD) {
-        motionWake = true;
-        Serial.println(" >> MOTION: waking detected");
+  if (!pirTriggered && !mp3->isRunning()) {
+    if (pir) {
+      if (pirHighStart == 0) {
+        pirHighStart = now;
+      } else if (now - pirHighStart >= PIR_HIGH_MS) {
+        pirTriggered      = true;
+        cryWindowStart    = now;
+        prevSoundV        = analogRead(MIC_PIN);
+        crySpikeCount     = 0;
+        Serial.println(" >> PIR: sustained HIGH → waking");
       }
+    } else {
+      pirHighStart = 0;
     }
-  } else if (motionWindowStart && now - motionWindowStart > MOTION_WINDOW_MS) {
-    motionWindowStart = 0;
-    motionCount = 0;
   }
 
-  // 3) Cry detection (only if motionWake and not currently playing)
-  if (motionWake && !mp3->isRunning()) {
-    int soundV = analogRead(MIC_PIN);
-    bool soundH = (soundV > SOUND_THRESHOLD);
-    Serial.printf(" Sound=%d\n", soundV);
-    if (soundH) {
-      if (!cryAbove) {
-        cryAbove = true;
-        cryStartTime = now;
-      } else if (now - cryStartTime >= SOUND_DETECT_MS) {
-        Serial.println(" >> CRY detected!");
+  // 3) Cry detection: count spikes in 5 s window
+  if (pirTriggered && !mp3->isRunning()) {
+    if (now - cryWindowStart <= CRY_WINDOW_MS) {
+      int soundV = analogRead(MIC_PIN);
+      int diff   = abs(soundV - prevSoundV);
+      if (diff > DIFF_THRESHOLD) {
+        crySpikeCount++;
+      }
+      if (diff > 300) {Serial.printf(" Sound diff=%d (spikes=%d/%d)\n", diff, crySpikeCount, CRY_COUNT_THRESHOLD);}
+
+      if (crySpikeCount >= CRY_COUNT_THRESHOLD) {
+        Serial.println(" >> CRY detected (spike count threshold reached)!");
         sendWarningToApp();
 
         if (lullabyCount < MAX_LULLABIES) {
@@ -158,13 +150,17 @@ void loop() {
           sendVibrateCommand();
         }
 
-        // reset for next waking episode
-        cryAbove = false;
-        motionWake = false;
-        motionWindowStart = 0;
+        // reset for next cycle
+        pirTriggered   = false;
+        pirHighStart   = 0;
+        crySpikeCount  = 0;
       }
+      prevSoundV = soundV;
     } else {
-      cryAbove = false;
+      Serial.printf(" >> Cry window expired (%d spikes), resetting\n", crySpikeCount);
+      pirTriggered   = false;
+      pirHighStart   = 0;
+      crySpikeCount  = 0;
     }
   }
 
