@@ -49,6 +49,7 @@
 
 #define SOUND_SENSOR_PIN   7
 #define MOTION_SENSOR_PIN  1
+#define BAT_ADC_PIN        6
 
 #define BCLK_AMPLIFIER_PIN 4
 #define DIN_AMPLIFIER_PIN  5
