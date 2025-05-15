@@ -10,11 +10,11 @@
 #include "pins_layout.h"  // defines BCLK_AMPLIFIER_PIN, LRC_AMPLIFIER_PIN, DIN_AMPLIFIER_PIN
 
 //=== Configuration ===
-const char* ssid      = "Vu Minh's iPhone";
-const char* password  = "hqhqhqhq";
+const char* ssid      = "yuuu";
+const char* password  = "servin022";
 const char* songURL   = "http://ia600107.us.archive.org/13/items/LullabySong/06-nickelback-lullaby.mp3";
 const float  gain     = 0.1f;
-const size_t BUF_SIZE = 8 * 1024;  // 8 KB buffer
+const size_t BUF_SIZE = 256 * 1024;  // 8 KB buffer
 
 //=== Audio components ===
 AudioFileSourceHTTPStream *file   = nullptr;
