@@ -40,6 +40,7 @@ const int            DIFF_THRESHOLD     = 300;
 const int            CRY_COUNT_THRESHOLD= 50;
 const int            MAX_LULLABIES      = 3;
 const size_t         BUF_SIZE           = 256 * 1024;
+const char* songURL   = "http://ia600107.us.archive.org/13/items/LullabySong/06-nickelback-lullaby.mp3";
 
 const int PIR_PIN = MOTION_SENSOR_PIN;
 const int MIC_PIN = SOUND_SENSOR_PIN;
@@ -92,7 +93,7 @@ bool apiLogin() {
   }
 
   apiToken = resp["token"].as<String>();
-  Serial.printf("→ Got API token: %s\n", apiToken.c_str());
+  Serial.printf("→ Success Login: Got API token: %s\n", apiToken.c_str());
   return true;
 }
 
@@ -120,31 +121,86 @@ bool sendPattern(const char* patternType) {
   int code = https.PUT(body);
   https.end();
 
-  if (code == HTTP_CODE_OK) {
-    Serial.printf("→ Sent pattern \"%s\"\n", patternType);
+  if (code >= 200 && code < 300) {
+    Serial.printf("→ Sent pattern \"%s\" (HTTP %d)\n", patternType, code);
     return true;
   } else {
-    Serial.printf("Pattern send failed: %d\n", code);
+    Serial.printf("Pattern send failed: HTTP %d\n", code);
     return false;
   }
 }
 
+String getFinalUrl(const String& apiUrl) {
+  WiFiClientSecure client;
+  client.setInsecure();  // or load your CA with client.setCACert(...)
+  
+  HTTPClient http;
+  http.begin(client, apiUrl);
+  http.addHeader("Authorization", "Bearer " + apiToken);
+
+  // we only need headers → do a GET but discard the body
+  int code = http.GET();
+  if (code == 301 || code == 302) {
+    String loc = http.getLocation();  
+    http.end();
+    return loc;
+  }
+  if (code == 200) {
+    http.end();
+    return apiUrl;
+  }
+  
+  Serial.printf("Redirect GET failed: HTTP %d\n", code);
+  http.end();
+  return String();  
+}
+
 bool playCloudSong(int soundId) {
-  String url = String("https://") + API_HOST
-               + "/api/devices/" + String(DEVICE_ID)
-               + "/sounds/" + soundId + "/download";
+  // ————— 1) tear down any prior playback —————
+  if (mp3->isRunning()) {
+    mp3->stop();
+    delay(10);
+  }
+  if (buffer) {
+    buffer->close();
+    delete buffer;
+    buffer = nullptr;
+  }
+  if (file) {
+    file->close();
+    delete file;
+    file = nullptr;
+  }
 
-  // library patched to add Authorization header in open()
-  auto* httpSource = new AudioFileSourceHTTPStream();
-  httpSource->open(url.c_str());
+  // ————— 2) build your API endpoint —————
+  String apiUrl = String("https://") + API_HOST
+                + "/api/devices/" + String(DEVICE_ID)
+                + "/sounds/" + soundId + "/download";
 
-  delete buffer;
-  buffer = new AudioFileSourceBuffer(httpSource, BUF_SIZE);
+  // ————— 3) resolve the redirect —————
+  String finalUrl = getFinalUrl(apiUrl);
+  if (finalUrl.length() == 0) {
+    Serial.println("→ Failed to resolve final URL");
+    return false;
+  }
+  Serial.printf("→ Streaming from: %s\n", finalUrl.c_str());
 
-  if (mp3->isRunning()) mp3->stop();
+  // ————— 4) open the real MP3 URL —————
+  file = new AudioFileSourceHTTPStream();
+  if (!file->open(finalUrl.c_str())) {
+    Serial.println("→ HTTPStream open() failed");
+    delete file;
+    file = nullptr;
+    return false;
+  }
+
+  // ————— 5) wrap & kick off the decoder —————
+  buffer = new AudioFileSourceBuffer(file, BUF_SIZE);
   mp3->begin(buffer, out);
+
   return true;
 }
+
 
 // BLE provisioning callback
 class CredsCallback : public NimBLECharacteristicCallbacks {
@@ -173,24 +229,32 @@ void setup() {
   pinMode(PIR_PIN, INPUT);
 
   // Load stored Wi-Fi creds
-  preferences.begin("wifi", false);
-  ssid     = preferences.getString("ssid", "");
-  password = preferences.getString("pass", "");
-  if (ssid == "aalto open") { preferences.clear(); ssid=""; password=""; }
+  // preferences.begin("wifi", false);
+  // ssid     = preferences.getString("ssid", "");
+  // password = preferences.getString("pass", "");
+  // Serial.printf("Stored Wi-Fi creds: \"%s\" / \"%s\"\n", ssid.c_str(), password.c_str());
+  
+  // if (ssid == "aalto open") { preferences.clear(); ssid=""; password=""; }
 
-  // BLE provisioning
-  initBleServer();
-  if (ssid.length() == 0) {
-    Serial.println("[BLE] Waiting for provisioning…");
-    while (!credsReceived) delay(500);
-    return;
-  }
+  // // BLE provisioning
+  // initBleServer();
+  // if (ssid.length() == 0) {
+  //   Serial.println("[BLE] Waiting for provisioning…");
+  //   while (!credsReceived) {
+  //     delay(500);
+  //     Serial.print(",");
+  //   }
+  //   return;
+  // }
+
+  ssid = "aalto open";
+  password = "";
 
   // Connect Wi-Fi
   Serial.printf("Connecting to Wi-Fi \"%s\"…\n", ssid.c_str());
   WiFi.begin(ssid.c_str(), password.c_str());
   WiFi.setSleep(true);
-  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print(".");}
   Serial.printf("\nWi-Fi up, IP=%s\n", WiFi.localIP().toString().c_str());
 
   // NTP time sync
@@ -245,9 +309,13 @@ void loop() {
         prevSound      = analogRead(MIC_PIN);
         crySpikes      = 0;
         Serial.println(">> PIR HIGH → baby awake");
-        sendPattern("awake");
+        //sendPattern("move");
+        sendWarningToApp();
       }
-    } else pirHighStart = 0;
+    } else {
+      pirHighStart = 0;
+      //sendPattern("sleep");
+    }
   }
 
   if (pirTriggered && !mp3->isRunning()) {
@@ -262,7 +330,8 @@ void loop() {
         if (lullabyCount < MAX_LULLABIES) {
           lullabyCount++;
           Serial.printf(" Playing lullaby #%d\n", lullabyCount);
-          startLullaby();
+          //startLullaby();
+          playCloudSong(lullabyCount);
         } else {
           Serial.println(" Max lullabies → vibrate");
           sendVibrateCommand();
@@ -300,10 +369,42 @@ void startLullaby() {
   mp3->begin(buffer, out);
 }
 
-void sendWarningToApp()   { Serial.println("[APP] Warning: baby crying!"); }
+bool sendCommand(const char* cmd) {
+  WiFiClientSecure client;
+  client.setInsecure();           // or setInsecure()
+  HTTPClient http;
+  String url = String("https://") + API_HOST
+               + "/api/devices/" + DEVICE_ID + "/commands";
+  http.begin(client, url);
+  http.addHeader("Authorization","Bearer "+apiToken);
+  http.addHeader("Content-Type","application/json");
 
-void sendVibrateCommand() { Serial.println("[APP] Command: vibrate phone"); }
+  // build payload
+  StaticJsonDocument<64> doc;
+  doc["type"] = cmd;
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.POST(body);
+  http.end();
+  if (code >= 200 && code < 300) {
+    Serial.printf("→ Sent command \"%s\" (HTTP %d)\n", cmd, code);
+    return true;
+  } else {
+    Serial.printf("Command send failed: HTTP %d\n", code);
+    return false;
+  }
+  return (code >=200 && code<300);
+ 
+}
+
+void sendWarningToApp()   { sendCommand("warning"); }
+
+void sendVibrateCommand() { sendCommand("vibrate"); }
+
 
 void sendTestFeedback(const char* msg) {
   Serial.printf("[TEST] %s\n", msg);
 }
+
+

@@ -45,7 +45,7 @@ void setup() {
   out->SetGain(gain);
 
   // — Buffered HTTP MP3 source & decoder —
-  file   = new AudioFileSourceHTTPStream(songURL);
+  file   = new AudioFileSourceHTTPStream(songURL); // delete the parameter later for to use URL from the cloud
   buffer = new AudioFileSourceBuffer(file, BUF_SIZE);
   mp3    = new AudioGeneratorMP3();
 
