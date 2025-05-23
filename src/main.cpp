@@ -15,6 +15,7 @@
 
 #define CAMERA_MODEL_XIAO_ESP32S3
 #include "pins_layout.h"  // BCLK_, LRC_, DIN_, MOTION_SENSOR_PIN, SOUND_SENSOR_PIN
+#include "camera_index.h"
 
 //=== Wi-Fi & provisioning ===
 Preferences    preferences;
@@ -32,6 +33,10 @@ static const char* API_PASS  = "demodemo";  // replace securely
 String             apiToken;
 
 //=== Audio & cry globals ===
+const float ADC_REF      = 3.3f;  
+const int   ADC_RES      = 4095;  
+// Divider ratio = (R1 + R2) / R2. E.g. 100 kΩ/100 kΩ → 2.0
+const float R_DIVIDER    = 2.0f;  
 const float          gain               = 0.2;
 const int            SOUND_THRESHOLD    = 2000;
 const unsigned long  PIR_HIGH_MS        = 3000;
@@ -54,12 +59,12 @@ AudioFileSourceBuffer     *buffer = nullptr;
 AudioGeneratorMP3         *mp3    = nullptr;
 AudioOutputI2S            *out    = nullptr;
 
-// Forward declarations
-void startLullaby();
-bool sendPattern(const char*);
-void sendWarningToApp();
-void sendVibrateCommand();
-void sendTestFeedback(const char*);
+// Map LiPo voltage (3.0–4.2 V) → %  
+float voltageToPercent(float v) {
+  if (v >= 4.20f) return 100.0f;
+  if (v <= 3.00f) return   0.0f;
+  return (v - 3.00f) / (4.20f - 3.00f) * 100.0f;
+}
 
 //=== Cloud functions ===
 bool apiLogin() {
@@ -130,32 +135,7 @@ bool sendPattern(const char* patternType) {
   }
 }
 
-String getFinalUrl(const String& apiUrl) {
-  WiFiClientSecure client;
-  client.setInsecure();  // or load your CA with client.setCACert(...)
-  
-  HTTPClient http;
-  http.begin(client, apiUrl);
-  http.addHeader("Authorization", "Bearer " + apiToken);
-
-  // we only need headers → do a GET but discard the body
-  int code = http.GET();
-  if (code == 301 || code == 302) {
-    String loc = http.getLocation();  
-    http.end();
-    return loc;
-  }
-  if (code == 200) {
-    http.end();
-    return apiUrl;
-  }
-  
-  Serial.printf("Redirect GET failed: HTTP %d\n", code);
-  http.end();
-  return String();  
-}
-
-bool playCloudSong(int soundId) {
+bool playCloudSong() {
   // ————— 1) tear down any prior playback —————
   if (mp3->isRunning()) {
     mp3->stop();
@@ -172,35 +152,141 @@ bool playCloudSong(int soundId) {
     file = nullptr;
   }
 
-  // ————— 2) build your API endpoint —————
-  String apiUrl = String("https://") + API_HOST
-                + "/api/devices/" + String(DEVICE_ID)
-                + "/sounds/" + soundId + "/download";
+  // ————— 2) build the "active sound" URL —————
+  String url = String("https://") + API_HOST
+               + "/api/devices/" + String(DEVICE_ID)
+               + "/sounds/active";
 
-  // ————— 3) resolve the redirect —————
-  String finalUrl = getFinalUrl(apiUrl);
-  if (finalUrl.length() == 0) {
-    Serial.println("→ Failed to resolve final URL");
-    return false;
-  }
-  Serial.printf("→ Streaming from: %s\n", finalUrl.c_str());
+  Serial.printf("→ Fetching active sound from: %s\n", url.c_str());
 
-  // ————— 4) open the real MP3 URL —————
+  // ————— 3) open the HTTP stream directly —————
   file = new AudioFileSourceHTTPStream();
-  if (!file->open(finalUrl.c_str())) {
-    Serial.println("→ HTTPStream open() failed");
+  if (!file->open(url.c_str())) {
+    // file->open() will return false on 404 or any non-200
+    Serial.println("→ No active sound or HTTP error");
     delete file;
     file = nullptr;
     return false;
   }
 
-  // ————— 5) wrap & kick off the decoder —————
+  // ————— 4) wrap & kick off the decoder —————
   buffer = new AudioFileSourceBuffer(file, BUF_SIZE);
   mp3->begin(buffer, out);
 
   return true;
 }
 
+void startLullaby() {
+  mp3->begin(buffer, out);
+}
+
+bool sendCommand(const char* cmd) {
+  WiFiClientSecure client;
+  client.setInsecure();           // or setInsecure()
+  HTTPClient http;
+  String url = String("https://") + API_HOST
+               + "/api/devices/" + DEVICE_ID + "/commands";
+  http.begin(client, url);
+  http.addHeader("Authorization","Bearer "+apiToken);
+  http.addHeader("Content-Type","application/json");
+
+  // build payload
+  StaticJsonDocument<64> doc;
+  doc["command"] = cmd;
+  String body;
+  serializeJson(doc, body);
+
+  int code = http.PUT(body);
+  http.end();
+  if (code >= 200 && code < 300) {
+    Serial.printf("→ Sent command \"%s\" (HTTP %d)\n", cmd, code);
+    return true;
+  } else {
+    Serial.printf("Command send failed: HTTP %d\n", code);
+    return false;
+  }
+  return (code >=200 && code<300);
+ 
+}
+
+void sendWarningToApp()   { sendCommand("notification"); }
+void sendVibrateCommand() { sendCommand("vibrate"); }
+void sendMotionFeedback() { sendCommand("motion_detected"); }
+void sendSoundFeedback() { sendCommand("sound_detected"); }
+
+// bool sendImageToCloud() {
+//   // 1) snap a photo
+//   camera_fb_t *fb = esp_camera_fb_get();
+//   if (!fb) {
+//     Serial.println("📸 Camera capture failed");
+//     return false;
+//   }
+
+//   // 2) prepare secure client
+//   WiFiClientSecure client;
+//   client.setInsecure();  // or use client.setCACert(yourCACert);
+
+//   // 3) build URL (change “image” to your real endpoint)
+//   String url = String("https://") + API_HOST
+//                + "/api/devices/" + String(DEVICE_ID)
+//                + "/image";
+
+//   // 4) POST the JPEG buffer
+//   HTTPClient http;
+//   http.begin(client, url);
+//   http.addHeader("Authorization", "Bearer " + apiToken);
+//   http.addHeader("Content-Type", "image/jpeg");
+
+//   int code = http.POST(fb->buf, fb->len);
+//   if (code >= 200 && code < 300) {
+//     Serial.printf("✅ Image upload OK (HTTP %d)\n", code);
+//     http.end();
+//     esp_camera_fb_return(fb);
+//     return true;
+//   } else {
+//     Serial.printf("❌ Image upload failed: HTTP %d\n", code);
+//     Serial.println(http.getString());
+//     http.end();
+//     esp_camera_fb_return(fb);
+//     return false;
+//   }
+// }
+
+bool sendIpToCloud(const String& ip) {
+  // 1) prepare secure client
+  WiFiClientSecure client;
+  client.setInsecure();  // or load your CA
+
+  // 2) build URL
+  String url = String("https://") + API_HOST
+               + "/api/devices/" + String(DEVICE_ID)
+               + "/ip";
+
+  // 3) start PUT
+  HTTPClient https;
+  https.begin(client, url);
+  https.addHeader("Authorization", "Bearer " + apiToken);
+  https.addHeader("Content-Type", "application/json");
+
+  // 4) build payload
+  StaticJsonDocument<64> doc;
+  doc["IPaddress"] = ip;                   // <-- as per cloud spec
+  String payload;
+  serializeJson(doc, payload);
+
+  // 5) send & clean up
+  int code = https.PUT(payload);
+  https.end();
+
+  // 6) report result
+  if (code >= 200 && code < 300) {
+    Serial.printf("→ Sent IP “%s” OK (HTTP %d)\n", ip.c_str(), code);
+    return true;
+  } else {
+    Serial.printf("→ Failed to send IP (HTTP %d)\n", code);
+    return false;
+  }
+}
 
 // BLE provisioning callback
 class CredsCallback : public NimBLECharacteristicCallbacks {
@@ -223,16 +309,51 @@ class CredsCallback : public NimBLECharacteristicCallbacks {
 
 void setup() {
   Serial.begin(115200);
+  
+  // camera_config_t config;
+  // config.ledc_channel = LEDC_CHANNEL_0;
+  // config.ledc_timer = LEDC_TIMER_0;
+  // config.pin_d0 = Y2_GPIO_NUM;
+  // config.pin_d1 = Y3_GPIO_NUM;
+  // config.pin_d2 = Y4_GPIO_NUM;
+  // config.pin_d3 = Y5_GPIO_NUM;
+  // config.pin_d4 = Y6_GPIO_NUM;
+  // config.pin_d5 = Y7_GPIO_NUM;
+  // config.pin_d6 = Y8_GPIO_NUM;
+  // config.pin_d7 = Y9_GPIO_NUM;
+  // config.pin_xclk = XCLK_GPIO_NUM;
+  // config.pin_pclk = PCLK_GPIO_NUM;
+  // config.pin_vsync = VSYNC_GPIO_NUM;
+  // config.pin_href = HREF_GPIO_NUM;
+  // config.pin_sccb_sda = SIOD_GPIO_NUM;
+  // config.pin_sccb_scl = SIOC_GPIO_NUM;
+  // config.pin_pwdn = PWDN_GPIO_NUM;
+  // config.pin_reset = RESET_GPIO_NUM;
+  // config.xclk_freq_hz = 20000000;
+  // config.frame_size = FRAMESIZE_UXGA;
+  // config.pixel_format = PIXFORMAT_JPEG;  // for streaming
+  // //config.pixel_format = PIXFORMAT_RGB565; // for face detection/recognition
+  // config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
+  // config.fb_location = CAMERA_FB_IN_PSRAM;
+  // config.jpeg_quality = 12;
+  // config.fb_count = 1;
+
+  // if (esp_camera_init(&config) != ESP_OK) {
+  //   Serial.println("Camera init failed");
+  //   while(true);
+  // }
+
+  
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
   pinMode(MIC_PIN, INPUT);
   pinMode(PIR_PIN, INPUT);
 
-  // Load stored Wi-Fi creds
-  // preferences.begin("wifi", false);
-  // ssid     = preferences.getString("ssid", "");
-  // password = preferences.getString("pass", "");
-  // Serial.printf("Stored Wi-Fi creds: \"%s\" / \"%s\"\n", ssid.c_str(), password.c_str());
+  //Load stored Wi-Fi creds
+  preferences.begin("wifi", false);
+  ssid     = preferences.getString("ssid", "");
+  password = preferences.getString("pass", "");
+  Serial.printf("Stored Wi-Fi creds: \"%s\" / \"%s\"\n", ssid.c_str(), password.c_str());
   
   // if (ssid == "aalto open") { preferences.clear(); ssid=""; password=""; }
 
@@ -257,6 +378,7 @@ void setup() {
   while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print(".");}
   Serial.printf("\nWi-Fi up, IP=%s\n", WiFi.localIP().toString().c_str());
 
+
   // NTP time sync
   configTime(0, 0, "pool.ntp.org", "time.google.com");
   Serial.print("Waiting for time");
@@ -270,6 +392,12 @@ void setup() {
   server.on("/test/on",  [](){ testMode=true;  server.send(200,"text/plain","ON"); });
   server.on("/test/off", [](){ testMode=false; server.send(200,"text/plain","OFF"); });
   server.begin();
+
+  // Send IP to cloud
+  String myIp = WiFi.localIP().toString();
+  if (!sendIpToCloud(myIp)) {
+    Serial.println("Error: could not register IP with cloud");
+  }
 
   // Audio init
   out = new AudioOutputI2S();
@@ -287,8 +415,8 @@ void setup() {
 void loop() {
   server.handleClient();
   if (testMode) {
-    if (digitalRead(PIR_PIN)) sendTestFeedback("motion");
-    if (analogRead(MIC_PIN) > SOUND_THRESHOLD) sendTestFeedback("sound");
+    if (digitalRead(PIR_PIN)) sendMotionFeedback();
+    if (analogRead(MIC_PIN) > SOUND_THRESHOLD) sendSoundFeedback();
     delay(100);
     return;
   }
@@ -308,9 +436,13 @@ void loop() {
         cryWindowStart = now;
         prevSound      = analogRead(MIC_PIN);
         crySpikes      = 0;
-        Serial.println(">> PIR HIGH → baby awake");
+        Serial.println(">> PIR HIGH → baby has some motions");
         //sendPattern("move");
         sendWarningToApp();
+        sendVibrateCommand();
+        sendPattern("sleep");
+        sendPattern("awake");
+        //playCloudSong();
       }
     } else {
       pirHighStart = 0;
@@ -324,14 +456,16 @@ void loop() {
       if (abs(v - prevSound) > DIFF_THRESHOLD) crySpikes++;
       prevSound = v;
       if (crySpikes >= CRY_COUNT_THRESHOLD) {
-        Serial.println(">> Cry detected!");
+        Serial.println(">> Cry detected! Baby is awake");
         sendWarningToApp();
         sendPattern("awake");
+        //sendImageToCloud();
+
         if (lullabyCount < MAX_LULLABIES) {
           lullabyCount++;
           Serial.printf(" Playing lullaby #%d\n", lullabyCount);
           //startLullaby();
-          playCloudSong(lullabyCount);
+          playCloudSong();
         } else {
           Serial.println(" Max lullabies → vibrate");
           sendVibrateCommand();
@@ -345,6 +479,16 @@ void loop() {
       pirTriggered = false;
       pirHighStart = 0;
     }
+  }
+
+  static unsigned long lastBatt = 0;
+  if (now - lastBatt >= 60000) {
+    lastBatt = now;
+    int raw   = analogRead(BAT_ADC_PIN);
+    float vDiv= raw / (float)ADC_RES * ADC_REF;
+    float vBat= vDiv * R_DIVIDER;
+    float pct = voltageToPercent(vBat);
+    Serial.printf("Battery: %.2f V (%.0f%%)\n", vBat, pct);
   }
 
   if (mp3->isRunning()) mp3->loop();
@@ -363,48 +507,6 @@ void initBleServer() {
   NimBLEDevice::getAdvertising()->addServiceUUID(svcUUID);
   NimBLEDevice::getAdvertising()->start();
   Serial.println("[BLE] advertising…");
-}
-
-void startLullaby() {
-  mp3->begin(buffer, out);
-}
-
-bool sendCommand(const char* cmd) {
-  WiFiClientSecure client;
-  client.setInsecure();           // or setInsecure()
-  HTTPClient http;
-  String url = String("https://") + API_HOST
-               + "/api/devices/" + DEVICE_ID + "/commands";
-  http.begin(client, url);
-  http.addHeader("Authorization","Bearer "+apiToken);
-  http.addHeader("Content-Type","application/json");
-
-  // build payload
-  StaticJsonDocument<64> doc;
-  doc["type"] = cmd;
-  String body;
-  serializeJson(doc, body);
-
-  int code = http.POST(body);
-  http.end();
-  if (code >= 200 && code < 300) {
-    Serial.printf("→ Sent command \"%s\" (HTTP %d)\n", cmd, code);
-    return true;
-  } else {
-    Serial.printf("Command send failed: HTTP %d\n", code);
-    return false;
-  }
-  return (code >=200 && code<300);
- 
-}
-
-void sendWarningToApp()   { sendCommand("warning"); }
-
-void sendVibrateCommand() { sendCommand("vibrate"); }
-
-
-void sendTestFeedback(const char* msg) {
-  Serial.printf("[TEST] %s\n", msg);
 }
 
 

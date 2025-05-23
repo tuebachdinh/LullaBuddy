@@ -14,7 +14,7 @@
 // Select camera model
 // ===================
 #define CAMERA_MODEL_XIAO_ESP32S3 // Has PSRAM
-#include "camera_pins.h"
+#include "pins_layout.h"
 
 // ===========================
 // Enter your WiFi credentials
