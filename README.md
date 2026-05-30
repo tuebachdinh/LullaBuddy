@@ -3,7 +3,6 @@
 An IoT baby monitor that detects crying and automatically plays lullabies, with real-time alerts sent to a companion mobile app.
 
 ![Device front view](asset/device.png)
-![Device owl design](asset/device_owl.png)
 ![Device shark design](asset/device_shark.png)
 
 ## How it works
