@@ -2,6 +2,10 @@
 
 An IoT baby monitor that detects crying and automatically plays lullabies, with real-time alerts sent to a companion mobile app.
 
+![Device front view](asset/device.png)
+![Device owl design](asset/device_owl.png)
+![Device shark design](asset/device_shark.png)
+
 ## How it works
 
 LullaBuddy runs on a **Seeed XIAO ESP32-S3** and monitors the baby using a PIR motion sensor and an analog microphone. When motion is detected and sustained crying follows, the device streams an MP3 lullaby over I2S audio and notifies parents through a cloud API. After a configurable maximum number of lullabies, it triggers a phone vibration alert instead.
@@ -54,6 +58,10 @@ pio device monitor
 ```
 
 By default the firmware connects to `aalto open` (open network, no password). To use a different network, edit the `ssid` and `password` values in `src/main.cpp`, or enable the BLE provisioning path that is already scaffolded in the code.
+
+### User demo scenario
+
+Watch the project demo on YouTube: https://www.youtube.com/watch?v=Os3BLjZEvdg
 
 ### Test mode
 
